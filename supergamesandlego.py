@@ -304,55 +304,63 @@ def heavy_math_worker(stop_event, pause_event):
             continue
         x = (x + 1.000001) * 1.000001
 
-def get_safe_ram_target():
-    """Berekent 85% van het beschikbare fysieke geheugen."""
-    try:
-        with open('/proc/meminfo', 'r') as f:
-            for line in f:
-                if 'MemAvailable:' in line:
-                    available_kb = int(line.split()[1])
-                    available_mb = (available_kb / 1024) * 0.85
-                    return int(available_mb)
-    except Exception:
-        pass
-    return 2048
-
-def heavy_ram_worker(size_mb, stop_event, pause_event):
-    """RAM worker met directe fysieke geheugentoewijzing."""
+def heavy_ram_worker(stop_event, pause_event):
+    """RAM worker die beschikbaar geheugen leest, er 3 GB van afhaalt, vult, leegt, en herhaalt."""
     if os.name == 'posix':
         try:
             os.setsid()
         except Exception:
             pass
-            
-    bytes_count = int(size_mb * 1024 * 1024)
-    allocated_data = None
 
-    try:
-        while not stop_event.is_set():
-            if pause_event.is_set():
-                if allocated_data is not None:
-                    del allocated_data
-                    allocated_data = None
-                time.sleep(0.1)
-                continue
+    RESERVE_GB = 3
+    RESERVE_BYTES = RESERVE_GB * 1024 * 1024 * 1024
 
-            if allocated_data is None:
-                try:
-                    allocated_data = bytearray(b'\xFF' * bytes_count)
-                except MemoryError:
-                    time.sleep(0.5)
-                    continue
+    while not stop_event.is_set():
+        if pause_event.is_set():
+            time.sleep(0.1)
+            continue
+
+        available_bytes = 0
+        if os.name == 'posix' and os.path.exists('/proc/meminfo'):
+            try:
+                with open('/proc/meminfo', 'r') as f:
+                    for line in f:
+                        if line.startswith('MemAvailable:'):
+                            available_bytes = int(line.split()[1]) * 1024
+                            break
+            except Exception:
+                pass
+
+        if available_bytes == 0:
+            try:
+                import psutil
+                available_bytes = psutil.virtual_memory().available
+            except ImportError:
+                available_bytes = 8 * 1024 * 1024 * 1024
+
+        target_bytes = available_bytes - RESERVE_BYTES
+        if target_bytes <= 0:
+            target_bytes = 512 * 1024 * 1024
+
+        allocated_data = None
+        try:
+            allocated_data = bytearray(b'\xFF' * target_bytes)
+            for offset in range(0, target_bytes, 4096):
+                if stop_event.is_set() or pause_event.is_set():
+                    break
+                allocated_data[offset] = 0xAA
 
             if not stop_event.is_set() and not pause_event.is_set():
-                allocated_data[0::4096] = b'\xAA' * (len(allocated_data[0::4096]))
-                time.sleep(0.01)
+                time.sleep(0.5)
 
-    except Exception:
-        pass
-    finally:
-        if allocated_data is not None:
-            del allocated_data
+        except MemoryError:
+            time.sleep(0.5)
+        finally:
+            if allocated_data is not None:
+                del allocated_data
+                allocated_data = None
+
+        time.sleep(0.2)
 
 def heavy_drive_worker(target_device, stop_event, pause_event):
     if os.name == 'posix':
@@ -405,15 +413,10 @@ class StressEngine:
                 self.mp_processes.append(p)
 
         if "B" in self.targets:
-            cores = multiprocessing.cpu_count()
-            total_target_mb = get_safe_ram_target()
-            mb_per_core = max(1, int(total_target_mb / cores))
-
-            for _ in range(cores):
-                p = multiprocessing.Process(target=heavy_ram_worker, args=(mb_per_core, self.stop_event, self.pause_event))
-                p.daemon = True
-                p.start()
-                self.mp_processes.append(p)
+            p = multiprocessing.Process(target=heavy_ram_worker, args=(self.stop_event, self.pause_event))
+            p.daemon = True
+            p.start()
+            self.mp_processes.append(p)
 
         if "GPU" in self.targets:
             if subprocess.call(["which", "gpu_burn"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
@@ -740,7 +743,7 @@ class SgalDashboard:
     def __init__(self):
         self.menu_items = [
             {"id": "A", "label": "CPU Stress Test (Forces 100% Multi-Core Load)", "type": "comp"},
-            {"id": "B", "label": "RAM Memory Test (Allocates Physical RAM)", "type": "comp"},
+            {"id": "B", "label": "RAM Memory Test (Dynamic Cycle: Avail - 3GB)", "type": "comp"},
             {"id": "GPU", "label": "GPU Stress Test (3D / OpenGL Rendering Pipeline)", "type": "comp"},
             {"id": "PULSE_OPT", "label": "Pulsing Load Mode (Pause/Resume Spikes)", "type": "pulse"},
         ]
