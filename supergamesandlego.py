@@ -318,7 +318,7 @@ def get_safe_ram_target():
     return 2048
 
 def heavy_ram_worker(size_mb, stop_event, pause_event):
-    """RAM worker met dynamische vrijgave bij pause_event."""
+    """RAM worker met directe fysieke geheugentoewijzing."""
     if os.name == 'posix':
         try:
             os.setsid()
@@ -326,51 +326,33 @@ def heavy_ram_worker(size_mb, stop_event, pause_event):
             pass
             
     bytes_count = int(size_mb * 1024 * 1024)
-    buf = None
-    mv = None
+    allocated_data = None
 
     try:
         while not stop_event.is_set():
             if pause_event.is_set():
-                if buf is not None:
-                    del mv
-                    del buf
-                    buf = None
-                    mv = None
+                if allocated_data is not None:
+                    del allocated_data
+                    allocated_data = None
                 time.sleep(0.1)
                 continue
 
-            if buf is None:
-                buf = bytearray(bytes_count)
-                mv = memoryview(buf)
-                chunk = b'\xFF' * (1024 * 1024)
-                for offset in range(0, bytes_count, 1024 * 1024):
-                    if stop_event.is_set() or pause_event.is_set():
-                        break
-                    limit = min(offset + 1024 * 1024, bytes_count)
-                    mv[offset:limit] = chunk[:limit - offset]
+            if allocated_data is None:
+                try:
+                    allocated_data = bytearray(b'\xFF' * bytes_count)
+                except MemoryError:
+                    time.sleep(0.5)
+                    continue
 
-            pattern1 = b'\xAA' * (1024 * 1024)
-            pattern2 = b'\x55' * (1024 * 1024)
+            if not stop_event.is_set() and not pause_event.is_set():
+                allocated_data[0::4096] = b'\xAA' * (len(allocated_data[0::4096]))
+                time.sleep(0.01)
 
-            for offset in range(0, bytes_count, 1024 * 1024):
-                if stop_event.is_set() or pause_event.is_set():
-                    break
-                limit = min(offset + 1024 * 1024, bytes_count)
-                mv[offset:limit] = pattern1[:limit - offset]
-
-            for offset in range(0, bytes_count, 1024 * 1024):
-                if stop_event.is_set() or pause_event.is_set():
-                    break
-                limit = min(offset + 1024 * 1024, bytes_count)
-                mv[offset:limit] = pattern2[:limit - offset]
-
-    except (MemoryError, Exception):
+    except Exception:
         pass
     finally:
-        if buf is not None:
-            del mv
-            del buf
+        if allocated_data is not None:
+            del allocated_data
 
 def heavy_drive_worker(target_device, stop_event, pause_event):
     if os.name == 'posix':
@@ -478,7 +460,6 @@ class StressEngine:
             self.pulse_thread.start()
 
     def _pulse_loop(self):
-        """Automatische regellus voor switchen tussen HIGH LOAD en LOW IDLE."""
         while self.is_running:
             self.pulse_state = ">>> 100% HIGH LOAD <<<"
             self.pause_event.clear()
