@@ -308,19 +308,41 @@ def heavy_math_worker():
     while True:
         x = (x + 1.000001) * 1.000001
 
-def heavy_ram_worker():
+def get_safe_ram_target():
+    """Calculates 85% of available RAM via /proc/meminfo to avoid OOM crashes."""
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            for line in f:
+                if 'MemAvailable:' in line:
+                    available_kb = int(line.split()[1])
+                    available_mb = (available_kb / 1024) * 0.85
+                    return int(available_mb)
+    except Exception:
+        pass
+    return 4096
+
+def heavy_ram_worker(size_mb, stop_event=None):
+    """Memory stress worker utilizing constant allocation and 4KB page stepping."""
     if os.name == 'posix':
         try:
             os.setsid()
         except Exception:
             pass
-    memory_blocks = []
+    bytes_count = size_mb * 1024 * 1024
     try:
         while True:
-            if len(memory_blocks) < 40:
-                memory_blocks.append(bytearray(100 * 1024 * 1024))
-            time.sleep(0.1)
-    except MemoryError:
+            if stop_event and stop_event.is_set():
+                break
+            # 1. CONSTANT WRITE (Continuous memory allocation)
+            buf = bytearray(os.urandom(bytes_count))
+            
+            # 2. INTENSIVE OVERWRITE (4KB page stepping)
+            for i in range(0, bytes_count, 4096):
+                buf[i] ^= 0xFF
+                
+            # 3. CONSTANT DELETE (Explicit deallocation)
+            del buf
+    except (KeyboardInterrupt, MemoryError, Exception):
         pass
 
 def heavy_drive_worker(target_device):
@@ -357,6 +379,7 @@ class StressEngine:
         self.pulse_thread = None
         self.is_running = False
         self.pulse_state = "100% LOAD" if pulsing else "STABLE LOAD"
+        self.stop_event = multiprocessing.Event()
 
     def _spawn_configured_workers(self):
         """Launches stress workers (uses stress-ng if available, falls back to native Python)."""
@@ -377,18 +400,23 @@ class StressEngine:
                     self.mp_processes.append(p)
 
         if "B" in self.targets:
+            cores = multiprocessing.cpu_count()
+            total_target_mb = get_safe_ram_target()
+            mb_per_core = max(1, int(total_target_mb / cores))
+
             if subprocess.call(["which", "stress-ng"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
                 p = subprocess.Popen(
-                    ["stress-ng", "--vm", "0", "--vm-bytes", "90%", "--vm-method", "all", "--page-in"], 
+                    ["stress-ng", "--vm", "0", "--vm-bytes", f"{total_target_mb}M", "--vm-method", "all", "--page-in"], 
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     preexec_fn=os.setsid if os.name == 'posix' else None
                 )
                 self.active_processes.append(p)
             else:
-                p = multiprocessing.Process(target=heavy_ram_worker)
-                p.daemon = True
-                p.start()
-                self.mp_processes.append(p)
+                for _ in range(cores):
+                    p = multiprocessing.Process(target=heavy_ram_worker, args=(mb_per_core, self.stop_event))
+                    p.daemon = True
+                    p.start()
+                    self.mp_processes.append(p)
 
         if "GPU" in self.targets:
             if subprocess.call(["which", "gpu_burn"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
@@ -435,6 +463,7 @@ class StressEngine:
 
     def start(self):
         self.is_running = True
+        self.stop_event.clear()
         self._spawn_configured_workers()
 
         if self.pulsing:
@@ -459,6 +488,7 @@ class StressEngine:
 
     def stop_all(self):
         self.is_running = False
+        self.stop_event.set()
         
         # Unfreeze before killing
         self._signal_workers(signal.SIGCONT)
@@ -542,10 +572,10 @@ class DiagnosticLogger:
             for entry in self.history:
                 f.write(f"timeintest {entry['time']}\n")
                 for comp, stats in entry['data'].items():
-                    f.write(f"{comp} {stats['cur']}⁰c\n")
-                    f.write(f"{comp}max {stats['max']}⁰c\n")
-                    f.write(f"{comp}min {stats['min']}⁰c\n")
-                    f.write(f"{comp}nominal {stats['nom']}⁰c\n")
+                    f.write(f"{comp} {stats['cur']}°c\n")
+                    f.write(f"{comp}max {stats['max']}°c\n")
+                    f.write(f"{comp}min {stats['min']}°c\n")
+                    f.write(f"{comp}nominal {stats['nom']}°c\n")
                 f.write("\n")
 
         print(f"\n[SYSTEM] Diagnostic log report saved: {filename}")
@@ -920,4 +950,3 @@ if __name__ == "__main__":
     DependencyChecker.check_and_prompt()
     app = SgalDashboard()
     app.run()
-    
