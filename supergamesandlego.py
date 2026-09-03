@@ -330,14 +330,14 @@ def heavy_ram_worker(size_mb, stop_event=None):
             pass
     bytes_count = size_mb * 1024 * 1024
     try:
-        while True:
-            if stop_event and stop_event.is_set():
-                break
+        while not (stop_event and stop_event.is_set()):
             # 1. CONSTANT WRITE (Continuous memory allocation)
             buf = bytearray(os.urandom(bytes_count))
             
             # 2. INTENSIVE OVERWRITE (4KB page stepping)
             for i in range(0, bytes_count, 4096):
+                if stop_event and stop_event.is_set():
+                    break
                 buf[i] ^= 0xFF
                 
             # 3. CONSTANT DELETE (Explicit deallocation)
@@ -455,7 +455,7 @@ class StressEngine:
 
         for p in self.mp_processes:
             try:
-                if p.pid:
+                if p.pid and p.is_alive():
                     pgid = os.getpgid(p.pid)
                     os.killpg(pgid, sig)
             except Exception:
@@ -490,13 +490,13 @@ class StressEngine:
         self.is_running = False
         self.stop_event.set()
         
-        # Unfreeze before killing
+        # Unfreeze before killing to allow clean OS exit
         self._signal_workers(signal.SIGCONT)
 
         for p in self.active_processes:
             try:
-                pgid = os.getpgid(p.pid)
-                os.killpg(pgid, signal.SIGKILL)
+                p.terminate()
+                p.wait(timeout=1)
             except Exception:
                 try:
                     p.kill()
@@ -506,10 +506,11 @@ class StressEngine:
 
         for p in self.mp_processes:
             try:
-                if p.pid:
-                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                if p.is_alive():
+                    p.terminate()
+                    p.join(timeout=1)
             except Exception:
-                p.terminate()
+                pass
         self.mp_processes.clear()
 
 # ==============================================================================
