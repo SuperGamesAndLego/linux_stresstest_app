@@ -32,13 +32,10 @@ class DependencyChecker:
 
         glmark_installed = subprocess.run(["which", "glmark2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
         gpu_burn_installed = subprocess.run(["which", "gpu_burn"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-        stress_ng_installed = subprocess.run(["which", "stress-ng"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
         sensors_installed = subprocess.run(["which", "sensors"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
         if not (glmark_installed or gpu_burn_installed):
             missing.append("glmark2")
-        if not stress_ng_installed:
-            missing.append("stress-ng")
         if not sensors_installed:
             missing.append("lm-sensors")
 
@@ -58,7 +55,7 @@ class DependencyChecker:
         if choice in ['', 'y', 'yes']:
             try:
                 subprocess.run(["sudo", "apt", "update"])
-                subprocess.run(["sudo", "apt", "install", "-y", "python3-numpy", "glmark2", "stress-ng", "lm-sensors"])
+                subprocess.run(["sudo", "apt", "install", "-y", "python3-numpy", "glmark2", "lm-sensors"])
             except Exception as e:
                 print(f"[ERROR] Could not install dependencies: {e}")
 
@@ -150,7 +147,6 @@ class HardwareSensors:
     def get_all_temperatures():
         metrics = {}
 
-        # 1. Linux sysfs hwmon scanner
         hwmon_base = "/sys/class/hwmon"
         if os.path.exists(hwmon_base):
             for dir_name in os.listdir(hwmon_base):
@@ -186,7 +182,6 @@ class HardwareSensors:
                         except Exception:
                             pass
 
-        # 2. LM-Sensors JSON parser Fallback
         try:
             res = subprocess.run(["sensors", "-j"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
             if res.returncode == 0 and res.stdout:
@@ -203,7 +198,6 @@ class HardwareSensors:
         except Exception:
             pass
 
-        # 3. NVIDIA GPU Dedicated Readout
         try:
             res = subprocess.run(
                 ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
@@ -293,10 +287,11 @@ class StorageDetector:
         return drives
 
 # ==============================================================================
-# 4. FALLBACK WORKERS (SAFE SYNCHRONIZATION VIA EVENTS)
+# 4. NATIVE WORKERS (SUPPORTING PULSE / PAUSE MODE)
 # ==============================================================================
 
 def heavy_math_worker(stop_event, pause_event):
+    """CPU Worker."""
     if os.name == 'posix':
         try:
             os.setsid()
@@ -310,38 +305,72 @@ def heavy_math_worker(stop_event, pause_event):
         x = (x + 1.000001) * 1.000001
 
 def get_safe_ram_target():
+    """Berekent 85% van het beschikbare fysieke geheugen."""
     try:
         with open('/proc/meminfo', 'r') as f:
             for line in f:
                 if 'MemAvailable:' in line:
                     available_kb = int(line.split()[1])
-                    available_mb = (available_kb / 1024) * 0.80
+                    available_mb = (available_kb / 1024) * 0.85
                     return int(available_mb)
     except Exception:
         pass
     return 2048
 
 def heavy_ram_worker(size_mb, stop_event, pause_event):
+    """RAM worker met dynamische vrijgave bij pause_event."""
     if os.name == 'posix':
         try:
             os.setsid()
         except Exception:
             pass
-    bytes_count = size_mb * 1024 * 1024
-    while not stop_event.is_set():
-        if pause_event.is_set():
-            time.sleep(0.1)
-            continue
+            
+    bytes_count = int(size_mb * 1024 * 1024)
+    buf = None
+    mv = None
 
-        try:
-            buf = bytearray(os.urandom(bytes_count))
-            for i in range(0, bytes_count, 4096):
+    try:
+        while not stop_event.is_set():
+            if pause_event.is_set():
+                if buf is not None:
+                    del mv
+                    del buf
+                    buf = None
+                    mv = None
+                time.sleep(0.1)
+                continue
+
+            if buf is None:
+                buf = bytearray(bytes_count)
+                mv = memoryview(buf)
+                chunk = b'\xFF' * (1024 * 1024)
+                for offset in range(0, bytes_count, 1024 * 1024):
+                    if stop_event.is_set() or pause_event.is_set():
+                        break
+                    limit = min(offset + 1024 * 1024, bytes_count)
+                    mv[offset:limit] = chunk[:limit - offset]
+
+            pattern1 = b'\xAA' * (1024 * 1024)
+            pattern2 = b'\x55' * (1024 * 1024)
+
+            for offset in range(0, bytes_count, 1024 * 1024):
                 if stop_event.is_set() or pause_event.is_set():
                     break
-                buf[i] ^= 0xFF
+                limit = min(offset + 1024 * 1024, bytes_count)
+                mv[offset:limit] = pattern1[:limit - offset]
+
+            for offset in range(0, bytes_count, 1024 * 1024):
+                if stop_event.is_set() or pause_event.is_set():
+                    break
+                limit = min(offset + 1024 * 1024, bytes_count)
+                mv[offset:limit] = pattern2[:limit - offset]
+
+    except (MemoryError, Exception):
+        pass
+    finally:
+        if buf is not None:
+            del mv
             del buf
-        except (MemoryError, Exception):
-            time.sleep(0.5)
 
 def heavy_drive_worker(target_device, stop_event, pause_event):
     if os.name == 'posix':
@@ -366,7 +395,7 @@ def heavy_drive_worker(target_device, stop_event, pause_event):
         pass
 
 # ==============================================================================
-# 5. STRESS ENGINE WITH SAFE MULTIPROCESSING CLEANUP
+# 5. STRESS ENGINE WITH AUTOMATIC PULSING SWITCH (HIGH / LOW)
 # ==============================================================================
 
 class StressEngine:
@@ -379,46 +408,30 @@ class StressEngine:
         self.pulse_off_sec = pulse_off_sec
         self.pulse_thread = None
         self.is_running = False
-        self.pulse_state = "100% LOAD" if pulsing else "STABLE LOAD"
+        self.pulse_state = "100% HIGH LOAD" if not pulsing else "INIT PULSING"
         
         self.stop_event = multiprocessing.Event()
         self.pause_event = multiprocessing.Event()
 
     def _spawn_configured_workers(self):
         if "A" in self.targets:
-            if subprocess.call(["which", "stress-ng"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
-                p = subprocess.Popen(
-                    ["stress-ng", "--cpu", "0", "--cpu-method", "all"], 
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    preexec_fn=os.setsid if os.name == 'posix' else None
-                )
-                self.active_processes.append(p)
-            else:
-                num_cores = multiprocessing.cpu_count()
-                for _ in range(num_cores):
-                    p = multiprocessing.Process(target=heavy_math_worker, args=(self.stop_event, self.pause_event))
-                    p.daemon = True
-                    p.start()
-                    self.mp_processes.append(p)
+            num_cores = multiprocessing.cpu_count()
+            for _ in range(num_cores):
+                p = multiprocessing.Process(target=heavy_math_worker, args=(self.stop_event, self.pause_event))
+                p.daemon = True
+                p.start()
+                self.mp_processes.append(p)
 
         if "B" in self.targets:
             cores = multiprocessing.cpu_count()
             total_target_mb = get_safe_ram_target()
             mb_per_core = max(1, int(total_target_mb / cores))
 
-            if subprocess.call(["which", "stress-ng"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
-                p = subprocess.Popen(
-                    ["stress-ng", "--vm", "0", "--vm-bytes", f"{total_target_mb}M", "--vm-method", "all", "--page-in"], 
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    preexec_fn=os.setsid if os.name == 'posix' else None
-                )
-                self.active_processes.append(p)
-            else:
-                for _ in range(cores):
-                    p = multiprocessing.Process(target=heavy_ram_worker, args=(mb_per_core, self.stop_event, self.pause_event))
-                    p.daemon = True
-                    p.start()
-                    self.mp_processes.append(p)
+            for _ in range(cores):
+                p = multiprocessing.Process(target=heavy_ram_worker, args=(mb_per_core, self.stop_event, self.pause_event))
+                p.daemon = True
+                p.start()
+                self.mp_processes.append(p)
 
         if "GPU" in self.targets:
             if subprocess.call(["which", "gpu_burn"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
@@ -444,7 +457,6 @@ class StressEngine:
                 self.mp_processes.append(p)
 
     def _signal_external_binaries(self, sig):
-        """Signals C binaries (like stress-ng or gpu_burn) directly via OS process groups."""
         for p in self.active_processes:
             try:
                 pgid = os.getpgid(p.pid)
@@ -466,6 +478,7 @@ class StressEngine:
             self.pulse_thread.start()
 
     def _pulse_loop(self):
+        """Automatische regellus voor switchen tussen HIGH LOAD en LOW IDLE."""
         while self.is_running:
             self.pulse_state = ">>> 100% HIGH LOAD <<<"
             self.pause_event.clear()
@@ -476,7 +489,7 @@ class StressEngine:
             if not self.is_running:
                 break
 
-            self.pulse_state = "<<< 0% IDLE FREEZE <<<"
+            self.pulse_state = "<<< 0% LOW IDLE <<<"
             self.pause_event.set()
             self._signal_external_binaries(signal.SIGSTOP)
 
@@ -590,7 +603,6 @@ class CleanupDownloadMenu:
         self.deps = [
             ("python3-numpy", "Python3 NumPy Module"),
             ("glmark2", "GLMark2 OpenGL Benchmark"),
-            ("stress-ng", "Stress-NG Stress Test Engine"),
             ("lm-sensors", "LM-Sensors Hardware Thermal Monitor")
         ]
         self.refresh_items()
