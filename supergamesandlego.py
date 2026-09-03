@@ -2,8 +2,7 @@
 """
 SUPERGAMESANDLEGO - Hardware Diagnostics & Stress Framework
 Optimized for Linux & Windows (Intel i9 / AMD Ryzen / NVIDIA RTX / RAM / Drives).
-Ensures STABLE 100% LOAD & 0% IDLE via Process Group SIGSTOP/SIGCONT signaling.
-Features: CPU, RAM, GPU, Drive Stress, Temperature Reading, BIOS & Fan Sensors, Granular Cleanup & Download Menu.
+Ensures STABLE 100% LOAD & 0% IDLE without Python Runtime/Semaphore Leaks.
 """
 
 import os
@@ -294,58 +293,57 @@ class StorageDetector:
         return drives
 
 # ==============================================================================
-# 4. FALLBACK WORKERS (PURE PYTHON - ZERO DEPENDENCIES REQUIRED)
+# 4. FALLBACK WORKERS (SAFE SYNCHRONIZATION VIA EVENTS)
 # ==============================================================================
 
-def heavy_math_worker():
-    """Pure Python CPU Stress worker - Uses infinite math loop per thread."""
+def heavy_math_worker(stop_event, pause_event):
     if os.name == 'posix':
         try:
             os.setsid()
         except Exception:
             pass
     x = 0.0001
-    while True:
+    while not stop_event.is_set():
+        if pause_event.is_set():
+            time.sleep(0.05)
+            continue
         x = (x + 1.000001) * 1.000001
 
 def get_safe_ram_target():
-    """Calculates 85% of available RAM via /proc/meminfo to avoid OOM crashes."""
     try:
         with open('/proc/meminfo', 'r') as f:
             for line in f:
                 if 'MemAvailable:' in line:
                     available_kb = int(line.split()[1])
-                    available_mb = (available_kb / 1024) * 0.85
+                    available_mb = (available_kb / 1024) * 0.80
                     return int(available_mb)
     except Exception:
         pass
-    return 4096
+    return 2048
 
-def heavy_ram_worker(size_mb, stop_event=None):
-    """Memory stress worker utilizing constant allocation and 4KB page stepping."""
+def heavy_ram_worker(size_mb, stop_event, pause_event):
     if os.name == 'posix':
         try:
             os.setsid()
         except Exception:
             pass
     bytes_count = size_mb * 1024 * 1024
-    try:
-        while not (stop_event and stop_event.is_set()):
-            # 1. CONSTANT WRITE (Continuous memory allocation)
+    while not stop_event.is_set():
+        if pause_event.is_set():
+            time.sleep(0.1)
+            continue
+
+        try:
             buf = bytearray(os.urandom(bytes_count))
-            
-            # 2. INTENSIVE OVERWRITE (4KB page stepping)
             for i in range(0, bytes_count, 4096):
-                if stop_event and stop_event.is_set():
+                if stop_event.is_set() or pause_event.is_set():
                     break
                 buf[i] ^= 0xFF
-                
-            # 3. CONSTANT DELETE (Explicit deallocation)
             del buf
-    except (KeyboardInterrupt, MemoryError, Exception):
-        pass
+        except (MemoryError, Exception):
+            time.sleep(0.5)
 
-def heavy_drive_worker(target_device):
+def heavy_drive_worker(target_device, stop_event, pause_event):
     if os.name == 'posix':
         try:
             os.setsid()
@@ -355,8 +353,11 @@ def heavy_drive_worker(target_device):
         dev_name = target_device.replace("DRIVE_", "")
         temp_file = f"/tmp/sgal_drive_{dev_name}.tmp"
         with open(temp_file, "wb") as f:
-            data = os.urandom(1024 * 1024 * 10)
-            while True:
+            data = os.urandom(1024 * 1024 * 5)
+            while not stop_event.is_set():
+                if pause_event.is_set():
+                    time.sleep(0.1)
+                    continue
                 f.write(data)
                 f.flush()
                 os.fsync(f.fileno())
@@ -365,7 +366,7 @@ def heavy_drive_worker(target_device):
         pass
 
 # ==============================================================================
-# 5. STRESS ENGINE WITH PROCESS GROUP SIGNALING
+# 5. STRESS ENGINE WITH SAFE MULTIPROCESSING CLEANUP
 # ==============================================================================
 
 class StressEngine:
@@ -379,10 +380,11 @@ class StressEngine:
         self.pulse_thread = None
         self.is_running = False
         self.pulse_state = "100% LOAD" if pulsing else "STABLE LOAD"
+        
         self.stop_event = multiprocessing.Event()
+        self.pause_event = multiprocessing.Event()
 
     def _spawn_configured_workers(self):
-        """Launches stress workers (uses stress-ng if available, falls back to native Python)."""
         if "A" in self.targets:
             if subprocess.call(["which", "stress-ng"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
                 p = subprocess.Popen(
@@ -394,7 +396,7 @@ class StressEngine:
             else:
                 num_cores = multiprocessing.cpu_count()
                 for _ in range(num_cores):
-                    p = multiprocessing.Process(target=heavy_math_worker)
+                    p = multiprocessing.Process(target=heavy_math_worker, args=(self.stop_event, self.pause_event))
                     p.daemon = True
                     p.start()
                     self.mp_processes.append(p)
@@ -413,7 +415,7 @@ class StressEngine:
                 self.active_processes.append(p)
             else:
                 for _ in range(cores):
-                    p = multiprocessing.Process(target=heavy_ram_worker, args=(mb_per_core, self.stop_event))
+                    p = multiprocessing.Process(target=heavy_ram_worker, args=(mb_per_core, self.stop_event, self.pause_event))
                     p.daemon = True
                     p.start()
                     self.mp_processes.append(p)
@@ -436,13 +438,13 @@ class StressEngine:
 
         for target in self.targets:
             if target.startswith("DRIVE_"):
-                p = multiprocessing.Process(target=heavy_drive_worker, args=(target,))
+                p = multiprocessing.Process(target=heavy_drive_worker, args=(target, self.stop_event, self.pause_event))
                 p.daemon = True
                 p.start()
                 self.mp_processes.append(p)
 
-    def _signal_workers(self, sig):
-        """Sends OS signal (SIGSTOP/SIGCONT) to process groups to freeze/unfreeze load."""
+    def _signal_external_binaries(self, sig):
+        """Signals C binaries (like stress-ng or gpu_burn) directly via OS process groups."""
         for p in self.active_processes:
             try:
                 pgid = os.getpgid(p.pid)
@@ -453,17 +455,10 @@ class StressEngine:
                 except Exception:
                     pass
 
-        for p in self.mp_processes:
-            try:
-                if p.pid and p.is_alive():
-                    pgid = os.getpgid(p.pid)
-                    os.killpg(pgid, sig)
-            except Exception:
-                pass
-
     def start(self):
         self.is_running = True
         self.stop_event.clear()
+        self.pause_event.clear()
         self._spawn_configured_workers()
 
         if self.pulsing:
@@ -471,10 +466,10 @@ class StressEngine:
             self.pulse_thread.start()
 
     def _pulse_loop(self):
-        """Instant Pause & Resume Loop without interrupting console output."""
         while self.is_running:
             self.pulse_state = ">>> 100% HIGH LOAD <<<"
-            self._signal_workers(signal.SIGCONT)
+            self.pause_event.clear()
+            self._signal_external_binaries(signal.SIGCONT)
 
             time.sleep(self.pulse_on_sec)
 
@@ -482,16 +477,17 @@ class StressEngine:
                 break
 
             self.pulse_state = "<<< 0% IDLE FREEZE <<<"
-            self._signal_workers(signal.SIGSTOP)
+            self.pause_event.set()
+            self._signal_external_binaries(signal.SIGSTOP)
 
             time.sleep(self.pulse_off_sec)
 
     def stop_all(self):
         self.is_running = False
         self.stop_event.set()
-        
-        # Unfreeze before killing to allow clean OS exit
-        self._signal_workers(signal.SIGCONT)
+        self.pause_event.clear()
+
+        self._signal_external_binaries(signal.SIGCONT)
 
         for p in self.active_processes:
             try:
@@ -506,9 +502,11 @@ class StressEngine:
 
         for p in self.mp_processes:
             try:
+                p.join(timeout=1)
                 if p.is_alive():
                     p.terminate()
-                    p.join(timeout=1)
+                if hasattr(p, 'close'):
+                    p.close()
             except Exception:
                 pass
         self.mp_processes.clear()
@@ -598,10 +596,8 @@ class CleanupDownloadMenu:
         self.refresh_items()
 
     def refresh_items(self):
-        """Scans installed dependencies and physical drives to build granular menu items."""
         self.items = []
         
-        # 1. Individual Dependency Installations
         for pkg, desc in self.deps:
             installed = subprocess.run(["dpkg", "-s", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
             status = "INSTALLED" if installed else "MISSING"
@@ -612,7 +608,6 @@ class CleanupDownloadMenu:
                 "pkg": pkg
             })
 
-        # 2. Individual Dependency Deletions
         for pkg, desc in self.deps:
             installed = subprocess.run(["dpkg", "-s", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
             if installed:
@@ -623,7 +618,6 @@ class CleanupDownloadMenu:
                     "pkg": pkg
                 })
 
-        # 3. Individual Drive Wipes
         drives = StorageDetector.get_physical_drives_extended()
         for d in drives:
             self.items.append({
@@ -634,7 +628,6 @@ class CleanupDownloadMenu:
                 "model": d['model']
             })
 
-        # 4. General Cleanup
         self.items.append({
             "id": "CLEAN_TMP",
             "label": "Clean Temp Files: Delete sgal_report_*.txt & /tmp temporary files",
@@ -703,10 +696,7 @@ class CleanupDownloadMenu:
             print("\n[!] No items selected for execution.")
             return
 
-        to_install = []
-        to_remove = []
-        to_wipe = []
-        clean_tmp = False
+        to_install, to_remove, to_wipe, clean_tmp = [], [], [], False
 
         for item in self.items:
             if item["id"] in self.selected:
@@ -719,18 +709,15 @@ class CleanupDownloadMenu:
                 elif item["action"] == "CLEAN_TMP":
                     clean_tmp = True
 
-        # 1. Perform Package Installation
         if to_install:
             print(f"\n[+] Installing selected dependencies: {', '.join(to_install)}")
             subprocess.run(["sudo", "apt", "update"])
             subprocess.run(["sudo", "apt", "install", "-y"] + to_install)
 
-        # 2. Perform Package Removal
         if to_remove:
             print(f"\n[+] Removing selected dependencies: {', '.join(to_remove)}")
             subprocess.run(["sudo", "apt", "remove", "-y"] + to_remove)
 
-        # 3. Perform Selective Drive Wipes
         if to_wipe:
             print("\n================================================================================")
             print(" WARNING: DRIVE ZERO-OUT DATA DESTRUCTION")
@@ -747,7 +734,6 @@ class CleanupDownloadMenu:
             else:
                 print("\n[!] Drive wiping cancelled: Confirmation keyword mismatch.")
 
-        # 4. Perform Temp Files Cleanup
         if clean_tmp:
             print("\n[+] Removing temporary diagnostic log files...")
             os.system("rm -f sgal_report_*.txt /tmp/sgal_drive_*.tmp")
