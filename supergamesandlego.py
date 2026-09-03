@@ -15,6 +15,8 @@ import multiprocessing
 import threading
 import signal
 import json
+import mmap
+import ctypes
 from datetime import datetime
 
 # ==============================================================================
@@ -305,60 +307,55 @@ def heavy_math_worker(stop_event, pause_event):
         x = (x + 1.000001) * 1.000001
 
 def heavy_ram_worker(stop_event, pause_event):
-    """RAM worker die beschikbaar geheugen leest, er 3 GB van afhaalt, vult, leegt, en herhaalt."""
+    """RAM worker die mmap en ctypes gebruikt om fysiek geheugen te garanderen."""
     if os.name == 'posix':
         try:
             os.setsid()
         except Exception:
             pass
 
-    RESERVE_GB = 3
-    RESERVE_BYTES = RESERVE_GB * 1024 * 1024 * 1024
+    RESERVE_BYTES = 3 * 1024 * 1024 * 1024
 
     while not stop_event.is_set():
         if pause_event.is_set():
             time.sleep(0.1)
             continue
 
-        available_bytes = 0
+        avail_bytes = 0
         if os.name == 'posix' and os.path.exists('/proc/meminfo'):
             try:
                 with open('/proc/meminfo', 'r') as f:
                     for line in f:
                         if line.startswith('MemAvailable:'):
-                            available_bytes = int(line.split()[1]) * 1024
+                            avail_bytes = int(line.split()[1]) * 1024
                             break
             except Exception:
                 pass
 
-        if available_bytes == 0:
-            try:
-                import psutil
-                available_bytes = psutil.virtual_memory().available
-            except ImportError:
-                available_bytes = 8 * 1024 * 1024 * 1024
+        if avail_bytes == 0:
+            avail_bytes = 8 * 1024 * 1024 * 1024
 
-        target_bytes = available_bytes - RESERVE_BYTES
+        target_bytes = avail_bytes - RESERVE_BYTES
         if target_bytes <= 0:
             target_bytes = 512 * 1024 * 1024
 
-        allocated_data = None
+        mm = None
         try:
-            allocated_data = bytearray(b'\xFF' * target_bytes)
-            for offset in range(0, target_bytes, 4096):
-                if stop_event.is_set() or pause_event.is_set():
-                    break
-                allocated_data[offset] = 0xAA
+            mm = mmap.mmap(-1, target_bytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS if os.name == 'posix' else mmap.MAP_PRIVATE)
+            ctypes.memset(ctypes.addressof(ctypes.c_char.from_buffer(mm)), 0xFF, target_bytes)
 
             if not stop_event.is_set() and not pause_event.is_set():
-                time.sleep(0.5)
+                time.sleep(1.0)
 
-        except MemoryError:
+        except (MemoryError, OverflowError, OSError):
             time.sleep(0.5)
         finally:
-            if allocated_data is not None:
-                del allocated_data
-                allocated_data = None
+            if mm is not None:
+                try:
+                    mm.close()
+                except Exception:
+                    pass
+                mm = None
 
         time.sleep(0.2)
 
@@ -413,10 +410,12 @@ class StressEngine:
                 self.mp_processes.append(p)
 
         if "B" in self.targets:
-            p = multiprocessing.Process(target=heavy_ram_worker, args=(self.stop_event, self.pause_event))
-            p.daemon = True
-            p.start()
-            self.mp_processes.append(p)
+            # We starten 2 workers op om de geheugenbanken parallel te verzadigen
+            for _ in range(2):
+                p = multiprocessing.Process(target=heavy_ram_worker, args=(self.stop_event, self.pause_event))
+                p.daemon = True
+                p.start()
+                self.mp_processes.append(p)
 
         if "GPU" in self.targets:
             if subprocess.call(["which", "gpu_burn"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
@@ -743,7 +742,7 @@ class SgalDashboard:
     def __init__(self):
         self.menu_items = [
             {"id": "A", "label": "CPU Stress Test (Forces 100% Multi-Core Load)", "type": "comp"},
-            {"id": "B", "label": "RAM Memory Test (Dynamic Cycle: Avail - 3GB)", "type": "comp"},
+            {"id": "B", "label": "RAM Memory Test (MMAP Kernel Allocation: Avail - 3GB)", "type": "comp"},
             {"id": "GPU", "label": "GPU Stress Test (3D / OpenGL Rendering Pipeline)", "type": "comp"},
             {"id": "PULSE_OPT", "label": "Pulsing Load Mode (Pause/Resume Spikes)", "type": "pulse"},
         ]
