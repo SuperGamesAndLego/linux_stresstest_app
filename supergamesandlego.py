@@ -17,7 +17,19 @@ import signal
 import json
 import mmap
 import ctypes
+import hashlib
 from datetime import datetime
+
+# ==============================================================================
+# RAM TEST CONFIG
+# ==============================================================================
+RAM_RESERVE_BYTES = 3 * 1024 * 1024 * 1024   # Left free for the OS/other apps
+RAM_BLOCK_SIZE = 64 * 1024 * 1024            # Allocate in 64MB chunks, not one giant buffer
+RAM_NUM_WORKERS = 2                          # Parallel workers to saturate memory channels
+# Classic memtest-style patterns, cycled each pass: all-zero, all-one,
+# alternating bits, then a random pass. Mixing patterns exercises more
+# failure modes than a single static fill ever could.
+RAM_PATTERNS = [b"\x00", b"\xff", b"\xaa", b"\x55", None]  # None => random pass
 
 # ==============================================================================
 # 0. AUTOMATED DEPENDENCY CHECKER
@@ -306,58 +318,112 @@ def heavy_math_worker(stop_event, pause_event):
             continue
         x = (x + 1.000001) * 1.000001
 
-def heavy_ram_worker(stop_event, pause_event):
-    """RAM worker die mmap en ctypes gebruikt om fysiek geheugen te garanderen."""
+def heavy_ram_worker(worker_id, total_workers, stop_event, pause_event, error_count, stats_array):
+    """
+    RAM worker: allocates its share of available RAM ONCE, in fixed-size
+    blocks (so a single giant allocation can't stall or fail outright), then
+    continuously writes/reads/verifies memory patterns across all of it.
+
+    This replaces the old approach of re-allocating and memset-ing a single
+    giant mmap block every second -- that only ever wrote one static pattern
+    (0xFF) and never read anything back, so it stressed allocation/dealloc
+    more than it stressed actual read/write bandwidth, and gave no way to
+    detect faulty RAM. This version keeps every byte constantly changing and
+    flags any checksum mismatch as a possible hardware fault.
+    """
     if os.name == 'posix':
         try:
             os.setsid()
         except Exception:
             pass
 
-    RESERVE_BYTES = 3 * 1024 * 1024 * 1024
+    # Determine how much RAM is actually available right now, then split
+    # (available - reserve) evenly across all RAM workers.
+    avail_bytes = 0
+    if os.name == 'posix' and os.path.exists('/proc/meminfo'):
+        try:
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    if line.startswith('MemAvailable:'):
+                        avail_bytes = int(line.split()[1]) * 1024
+                        break
+        except Exception:
+            pass
+    if avail_bytes == 0:
+        avail_bytes = 8 * 1024 * 1024 * 1024
+
+    target_total = avail_bytes - RAM_RESERVE_BYTES
+    if target_total <= 0:
+        target_total = 512 * 1024 * 1024
+    target_bytes = target_total // total_workers
+
+    # Allocate in fixed-size blocks instead of one giant buffer, so a
+    # partial-allocation failure just means testing less RAM instead of
+    # crashing the worker outright.
+    blocks = []
+    allocated = 0
+    while allocated < target_bytes and not stop_event.is_set():
+        remaining = target_bytes - allocated
+        this_size = min(RAM_BLOCK_SIZE, remaining)
+        if this_size <= 0:
+            break
+        try:
+            block = bytearray(this_size)
+        except MemoryError:
+            print(f"[RAM worker {worker_id}] MemoryError after {allocated / (1024**3):.2f} GB "
+                  f"(target was {target_bytes / (1024**3):.2f} GB). Continuing with what was allocated.",
+                  flush=True)
+            break
+        blocks.append(block)
+        allocated += this_size
+
+    print(f"[RAM worker {worker_id}] allocated {allocated / (1024**3):.2f} GB in {len(blocks)} blocks", flush=True)
+
+    if not blocks:
+        return
+
+    pattern_idx = 0
+    bytes_since_report = 0
+    last_report = time.time()
 
     while not stop_event.is_set():
         if pause_event.is_set():
-            time.sleep(0.1)
+            time.sleep(0.05)
             continue
 
-        avail_bytes = 0
-        if os.name == 'posix' and os.path.exists('/proc/meminfo'):
-            try:
-                with open('/proc/meminfo', 'r') as f:
-                    for line in f:
-                        if line.startswith('MemAvailable:'):
-                            avail_bytes = int(line.split()[1]) * 1024
-                            break
-            except Exception:
-                pass
+        pattern = RAM_PATTERNS[pattern_idx % len(RAM_PATTERNS)]
+        pattern_idx += 1
 
-        if avail_bytes == 0:
-            avail_bytes = 8 * 1024 * 1024 * 1024
+        for block in blocks:
+            if stop_event.is_set():
+                break
+            if pause_event.is_set():
+                break  # drop out to the outer loop so pause takes effect fast, not mid-pass
 
-        target_bytes = avail_bytes - RESERVE_BYTES
-        if target_bytes <= 0:
-            target_bytes = 512 * 1024 * 1024
+            if pattern is None:
+                data = os.urandom(len(block))
+                block[:] = data
+                expected = hashlib.md5(data).digest()
+            else:
+                block[:] = pattern * len(block)
+                expected = hashlib.md5(block).digest()
 
-        mm = None
-        try:
-            mm = mmap.mmap(-1, target_bytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS if os.name == 'posix' else mmap.MAP_PRIVATE)
-            ctypes.memset(ctypes.addressof(ctypes.c_char.from_buffer(mm)), 0xFF, target_bytes)
+            # Read it back and verify.
+            actual = hashlib.md5(block).digest()
+            if actual != expected:
+                with error_count.get_lock():
+                    error_count.value += 1
+                print(f"[RAM worker {worker_id}] !!! CHECKSUM MISMATCH -- possible bad RAM detected !!!", flush=True)
 
-            if not stop_event.is_set() and not pause_event.is_set():
-                time.sleep(1.0)
+            bytes_since_report += len(block) * 2  # write + read
 
-        except (MemoryError, OverflowError, OSError):
-            time.sleep(0.5)
-        finally:
-            if mm is not None:
-                try:
-                    mm.close()
-                except Exception:
-                    pass
-                mm = None
+            now = time.time()
+            if now - last_report >= 1.0:
+                stats_array[worker_id] = bytes_since_report / (now - last_report)
+                bytes_since_report = 0
+                last_report = now
 
-        time.sleep(0.2)
+    blocks.clear()
 
 def heavy_drive_worker(target_device, stop_event, pause_event):
     if os.name == 'posix':
@@ -400,6 +466,11 @@ class StressEngine:
         self.stop_event = multiprocessing.Event()
         self.pause_event = multiprocessing.Event()
 
+        # Shared counters the RAM workers report into, so the dashboard can
+        # display live throughput and flag any checksum mismatches.
+        self.ram_error_count = multiprocessing.Value(ctypes.c_long, 0)
+        self.ram_stats = multiprocessing.Array(ctypes.c_double, RAM_NUM_WORKERS)
+
     def _spawn_configured_workers(self):
         if "A" in self.targets:
             num_cores = multiprocessing.cpu_count()
@@ -410,9 +481,13 @@ class StressEngine:
                 self.mp_processes.append(p)
 
         if "B" in self.targets:
-            # We starten 2 workers op om de geheugenbanken parallel te verzadigen
-            for _ in range(2):
-                p = multiprocessing.Process(target=heavy_ram_worker, args=(self.stop_event, self.pause_event))
+            # We starten meerdere workers op om de geheugenbanken/kanalen parallel te verzadigen
+            for i in range(RAM_NUM_WORKERS):
+                p = multiprocessing.Process(
+                    target=heavy_ram_worker,
+                    args=(i, RAM_NUM_WORKERS, self.stop_event, self.pause_event,
+                          self.ram_error_count, self.ram_stats)
+                )
                 p.daemon = True
                 p.start()
                 self.mp_processes.append(p)
@@ -882,6 +957,10 @@ class SgalDashboard:
                 if fan_speeds:
                     for fan, rpm in fan_speeds.items():
                         print(f"  [FAN]  {fan:<35}: {rpm} RPM")
+
+                if "B" in stress.targets:
+                    ram_throughput = sum(stress.ram_stats) / (1024 * 1024)
+                    print(f"  [RAM]  Throughput: {ram_throughput:.1f} MB/s | Checksum errors: {stress.ram_error_count.value}")
 
                 if logger and live_temps:
                     logger.log_snapshot(live_temps)
