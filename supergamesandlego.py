@@ -461,10 +461,23 @@ class StressEngine:
         self.pulse_off_sec = pulse_off_sec
         self.pulse_thread = None
         self.is_running = False
-        self.pulse_state = "100% HIGH LOAD" if not pulsing else "INIT PULSING"
-        
+
         self.stop_event = multiprocessing.Event()
         self.pause_event = multiprocessing.Event()
+
+        # "A" / "B" / "GPU" / "DRIVE_*" are the ids that actually spawn a
+        # worker and generate load. PULSE_OPT is just a load-shaping
+        # modifier, not a workload itself, so it must not count here --
+        # otherwise the status line below would still claim "100% HIGH
+        # LOAD" even when zero workers are actually running.
+        self._has_workload = any(
+            t == "A" or t == "B" or t == "GPU" or t.startswith("DRIVE_")
+            for t in self.targets
+        )
+        if not self._has_workload:
+            self.pulse_state = "IDLE (no components selected)"
+        else:
+            self.pulse_state = "100% HIGH LOAD" if not pulsing else "INIT PULSING"
 
         # Shared counters the RAM workers report into, so the dashboard can
         # display live throughput and flag any checksum mismatches.
@@ -532,7 +545,7 @@ class StressEngine:
         self.pause_event.clear()
         self._spawn_configured_workers()
 
-        if self.pulsing:
+        if self.pulsing and self._has_workload:
             self.pulse_thread = threading.Thread(target=self._pulse_loop, daemon=True)
             self.pulse_thread.start()
 
