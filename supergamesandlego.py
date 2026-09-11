@@ -425,6 +425,258 @@ def heavy_ram_worker(worker_id, total_workers, stop_event, pause_event, error_co
 
     blocks.clear()
 
+def _load_cuda_driver():
+    """
+    Try to load the CUDA Driver API library. This ships with the NVIDIA
+    driver itself (not the CUDA toolkit) -- if `nvidia-smi` works on this
+    machine, libcuda.so.1 is normally already present, so no extra installs
+    are required. Returns None if it can't be found.
+    """
+    for name in ("libcuda.so.1", "libcuda.so"):
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            continue
+    return None
+
+
+def _setup_cuda_prototypes(cuda):
+    """
+    Explicitly declare argtypes/restype for every CUDA Driver API call we
+    use. This is the single most important safety step with ctypes: without
+    it, ctypes falls back to guessing argument widths, which can silently
+    truncate 64-bit pointers/sizes on a 64-bit system and crash or corrupt
+    memory. Declaring everything by hand removes that risk entirely.
+    """
+    CU_RESULT = ctypes.c_int
+    CU_DEVICE = ctypes.c_int
+    CU_CONTEXT = ctypes.c_void_p
+    CU_DEVICEPTR = ctypes.c_ulonglong  # always 8 bytes on 64-bit (__LP64__) per cuda.h
+
+    cuda.cuInit.argtypes = [ctypes.c_uint]
+    cuda.cuInit.restype = CU_RESULT
+
+    cuda.cuDeviceGet.argtypes = [ctypes.POINTER(CU_DEVICE), ctypes.c_int]
+    cuda.cuDeviceGet.restype = CU_RESULT
+
+    cuda.cuDeviceGetName.argtypes = [ctypes.c_char_p, ctypes.c_int, CU_DEVICE]
+    cuda.cuDeviceGetName.restype = CU_RESULT
+
+    cuda.cuCtxCreate_v2.argtypes = [ctypes.POINTER(CU_CONTEXT), ctypes.c_uint, CU_DEVICE]
+    cuda.cuCtxCreate_v2.restype = CU_RESULT
+
+    cuda.cuCtxDestroy_v2.argtypes = [CU_CONTEXT]
+    cuda.cuCtxDestroy_v2.restype = CU_RESULT
+
+    cuda.cuMemGetInfo_v2.argtypes = [ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
+    cuda.cuMemGetInfo_v2.restype = CU_RESULT
+
+    cuda.cuMemAlloc_v2.argtypes = [ctypes.POINTER(CU_DEVICEPTR), ctypes.c_size_t]
+    cuda.cuMemAlloc_v2.restype = CU_RESULT
+
+    cuda.cuMemFree_v2.argtypes = [CU_DEVICEPTR]
+    cuda.cuMemFree_v2.restype = CU_RESULT
+
+    cuda.cuMemsetD32_v2.argtypes = [CU_DEVICEPTR, ctypes.c_uint, ctypes.c_size_t]
+    cuda.cuMemsetD32_v2.restype = CU_RESULT
+
+    cuda.cuMemcpyHtoD_v2.argtypes = [CU_DEVICEPTR, ctypes.c_void_p, ctypes.c_size_t]
+    cuda.cuMemcpyHtoD_v2.restype = CU_RESULT
+
+    cuda.cuMemcpyDtoH_v2.argtypes = [ctypes.c_void_p, CU_DEVICEPTR, ctypes.c_size_t]
+    cuda.cuMemcpyDtoH_v2.restype = CU_RESULT
+
+    cuda.cuGetErrorString.argtypes = [CU_RESULT, ctypes.POINTER(ctypes.c_char_p)]
+    cuda.cuGetErrorString.restype = CU_RESULT
+
+    return CU_DEVICE, CU_CONTEXT, CU_DEVICEPTR
+
+
+def _cuda_check(cuda, result, call_name):
+    if result != 0:
+        err_str = ctypes.c_char_p()
+        try:
+            cuda.cuGetErrorString(result, ctypes.byref(err_str))
+            msg = err_str.value.decode(errors="ignore") if err_str.value else f"error {result}"
+        except Exception:
+            msg = f"error {result}"
+        raise RuntimeError(f"{call_name} failed: {msg}")
+
+
+def _count_nvidia_gpus():
+    """
+    Count GPUs via `nvidia-smi -L`, a plain external process call.
+    Deliberately NOT done via ctypes/libcuda in the parent process: CUDA is
+    not fork-safe, so if the parent initialized CUDA before forking off the
+    worker processes, the children could inherit broken driver state. Using
+    a separate subprocess sidesteps that entirely.
+    """
+    try:
+        res = subprocess.run(["nvidia-smi", "-L"], stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, text=True, timeout=5)
+        if res.returncode == 0:
+            lines = [l for l in res.stdout.strip().split("\n") if l.strip()]
+            if lines:
+                return len(lines)
+    except Exception:
+        pass
+    return 1  # sensible fallback: assume at least one GPU
+
+
+def heavy_gpu_worker(device_index, stop_event, pause_event, error_count, stats_array, reserve_fraction=0.1):
+    """
+    Offline, dependency-free GPU stress test. Talks directly to the CUDA
+    Driver API (libcuda.so.1) via ctypes -- no CUDA toolkit, no nvcc, no
+    pip installs, no third-party binaries. If `nvidia-smi` works on this
+    machine, the driver library is normally already present.
+
+    Scope note: without a compiler on hand there's no way to hand the GPU a
+    compute kernel, so this does not stress the ALU/compute cores the way
+    gpu_burn does. What it DOES do is a genuine VRAM stress test: it
+    continuously fills GPU memory with patterns (the driver itself performs
+    the write via cuMemsetD32, or a random buffer is uploaded via
+    cuMemcpyHtoD), reads it back, and checksum-verifies it -- exercising
+    VRAM, the memory controller, and the PCIe/NVLink bus, and flagging any
+    mismatch as a possible hardware fault.
+    """
+    if os.name == 'posix':
+        try:
+            os.setsid()
+        except Exception:
+            pass
+
+    cuda = _load_cuda_driver()
+    if cuda is None:
+        print(f"[GPU worker {device_index}] Could not load libcuda.so.1 -- the NVIDIA "
+              f"driver's CUDA library isn't available on this system, even though "
+              f"nvidia-smi works. No offline GPU test is possible without it.", flush=True)
+        return
+
+    try:
+        CU_DEVICE, CU_CONTEXT, CU_DEVICEPTR = _setup_cuda_prototypes(cuda)
+
+        r = cuda.cuInit(0)
+        _cuda_check(cuda, r, "cuInit")
+
+        device = CU_DEVICE()
+        r = cuda.cuDeviceGet(ctypes.byref(device), device_index)
+        _cuda_check(cuda, r, "cuDeviceGet")
+
+        name_buf = ctypes.create_string_buffer(256)
+        cuda.cuDeviceGetName(name_buf, 256, device)
+        gpu_name = name_buf.value.decode(errors="ignore")
+
+        context = CU_CONTEXT()
+        r = cuda.cuCtxCreate_v2(ctypes.byref(context), 0, device)
+        _cuda_check(cuda, r, "cuCtxCreate_v2")
+
+        free_bytes = ctypes.c_size_t()
+        total_bytes = ctypes.c_size_t()
+        r = cuda.cuMemGetInfo_v2(ctypes.byref(free_bytes), ctypes.byref(total_bytes))
+        _cuda_check(cuda, r, "cuMemGetInfo_v2")
+
+        target_bytes = int(free_bytes.value * (1 - reserve_fraction))
+        print(f"[GPU worker {device_index}] {gpu_name}: {free_bytes.value / (1024**3):.2f} GB free, "
+              f"targeting {target_bytes / (1024**3):.2f} GB", flush=True)
+    except Exception as e:
+        print(f"[GPU worker {device_index}] setup failed: {e}", flush=True)
+        return
+
+    block_size = 64 * 1024 * 1024
+    blocks = []  # list of (CU_DEVICEPTR instance, size)
+    allocated = 0
+    while allocated < target_bytes and not stop_event.is_set():
+        remaining = target_bytes - allocated
+        this_size = min(block_size, remaining)
+        if this_size <= 0:
+            break
+        dptr = CU_DEVICEPTR()
+        r = cuda.cuMemAlloc_v2(ctypes.byref(dptr), ctypes.c_size_t(this_size))
+        if r != 0:
+            print(f"[GPU worker {device_index}] allocation stopped after "
+                  f"{allocated / (1024**3):.2f} GB (driver error {r}). "
+                  f"Continuing with what was allocated.", flush=True)
+            break
+        blocks.append((dptr, this_size))
+        allocated += this_size
+
+    print(f"[GPU worker {device_index}] allocated {allocated / (1024**3):.2f} GB "
+          f"in {len(blocks)} blocks", flush=True)
+
+    if not blocks:
+        try:
+            cuda.cuCtxDestroy_v2(context)
+        except Exception:
+            pass
+        return
+
+    GPU_PATTERNS = [0x00000000, 0xFFFFFFFF, 0xAAAAAAAA, 0x55555555, None]
+    pattern_idx = 0
+    bytes_since_report = 0
+    last_report = time.time()
+
+    while not stop_event.is_set():
+        if pause_event.is_set():
+            time.sleep(0.05)
+            continue
+
+        pattern = GPU_PATTERNS[pattern_idx % len(GPU_PATTERNS)]
+        pattern_idx += 1
+
+        for dptr, size in blocks:
+            if stop_event.is_set():
+                break
+            if pause_event.is_set():
+                break  # drop out to the outer loop so pause takes effect fast
+
+            if pattern is None:
+                data = os.urandom(size)
+                src = (ctypes.c_char * size).from_buffer_copy(data)
+                r = cuda.cuMemcpyHtoD_v2(dptr, src, ctypes.c_size_t(size))
+                expected = hashlib.md5(data).digest()
+            else:
+                num_words = size // 4
+                r = cuda.cuMemsetD32_v2(dptr, ctypes.c_uint(pattern), ctypes.c_size_t(num_words))
+                expected = hashlib.md5(pattern.to_bytes(4, 'little') * num_words).digest()
+
+            if r != 0:
+                with error_count.get_lock():
+                    error_count.value += 1
+                print(f"[GPU worker {device_index}] write failed (driver error {r})", flush=True)
+                continue
+
+            readback = (ctypes.c_char * size)()
+            r = cuda.cuMemcpyDtoH_v2(readback, dptr, ctypes.c_size_t(size))
+            if r != 0:
+                with error_count.get_lock():
+                    error_count.value += 1
+                print(f"[GPU worker {device_index}] readback failed (driver error {r})", flush=True)
+                continue
+
+            actual = hashlib.md5(bytes(readback)).digest()
+            if actual != expected:
+                with error_count.get_lock():
+                    error_count.value += 1
+                print(f"[GPU worker {device_index}] !!! CHECKSUM MISMATCH -- possible VRAM fault !!!", flush=True)
+
+            bytes_since_report += size * 2  # write + read
+            now = time.time()
+            if now - last_report >= 1.0:
+                stats_array[device_index] = bytes_since_report / (now - last_report)
+                bytes_since_report = 0
+                last_report = now
+
+    for dptr, size in blocks:
+        try:
+            cuda.cuMemFree_v2(dptr)
+        except Exception:
+            pass
+    try:
+        cuda.cuCtxDestroy_v2(context)
+    except Exception:
+        pass
+
+
 def heavy_drive_worker(target_device, stop_event, pause_event):
     if os.name == 'posix':
         try:
@@ -484,6 +736,14 @@ class StressEngine:
         self.ram_error_count = multiprocessing.Value(ctypes.c_long, 0)
         self.ram_stats = multiprocessing.Array(ctypes.c_double, RAM_NUM_WORKERS)
 
+        # Same idea for the built-in GPU VRAM test. GPU count is queried via
+        # `nvidia-smi -L` (a separate process) rather than ctypes/libcuda
+        # here in the parent -- CUDA is not fork-safe, so touching it before
+        # forking the worker processes could corrupt state they inherit.
+        self._gpu_count = max(1, _count_nvidia_gpus())
+        self.gpu_error_count = multiprocessing.Value(ctypes.c_long, 0)
+        self.gpu_stats = multiprocessing.Array(ctypes.c_double, self._gpu_count)
+
     def _spawn_configured_workers(self):
         if "A" in self.targets:
             num_cores = multiprocessing.cpu_count()
@@ -520,6 +780,20 @@ class StressEngine:
                     preexec_fn=os.setsid if os.name == 'posix' else None
                 )
                 self.active_processes.append(p)
+            else:
+                # Neither external tool is installed. Fall back to the
+                # built-in, dependency-free VRAM stress test (ctypes +
+                # libcuda.so.1 -- no toolkit, no compiler, fully offline).
+                print(f"[SYSTEM] gpu_burn/glmark2 not found -- using the built-in "
+                      f"offline GPU VRAM test instead ({self._gpu_count} GPU(s) detected).", flush=True)
+                for gi in range(self._gpu_count):
+                    p = multiprocessing.Process(
+                        target=heavy_gpu_worker,
+                        args=(gi, self.stop_event, self.pause_event, self.gpu_error_count, self.gpu_stats)
+                    )
+                    p.daemon = True
+                    p.start()
+                    self.mp_processes.append(p)
 
         for target in self.targets:
             if target.startswith("DRIVE_"):
@@ -974,6 +1248,11 @@ class SgalDashboard:
                 if "B" in stress.targets:
                     ram_throughput = sum(stress.ram_stats) / (1024 * 1024)
                     print(f"  [RAM]  Throughput: {ram_throughput:.1f} MB/s | Checksum errors: {stress.ram_error_count.value}")
+
+                if "GPU" in stress.targets:
+                    gpu_throughput = sum(stress.gpu_stats) / (1024 * 1024)
+                    if gpu_throughput > 0 or stress.gpu_error_count.value > 0:
+                        print(f"  [GPU]  VRAM Throughput: {gpu_throughput:.1f} MB/s | Checksum errors: {stress.gpu_error_count.value}")
 
                 if logger and live_temps:
                     logger.log_snapshot(live_temps)
