@@ -766,6 +766,8 @@ class StressEngine:
                 self.mp_processes.append(p)
 
         if "GPU" in self.targets:
+            has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
             if subprocess.call(["which", "gpu_burn"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
                 p = subprocess.Popen(
                     ["gpu_burn", "999999"], 
@@ -773,7 +775,7 @@ class StressEngine:
                     preexec_fn=os.setsid if os.name == 'posix' else None
                 )
                 self.active_processes.append(p)
-            elif subprocess.call(["which", "glmark2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
+            elif has_display and subprocess.call(["which", "glmark2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
                 p = subprocess.Popen(
                     ["glmark2", "--run-forever"], 
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -781,11 +783,21 @@ class StressEngine:
                 )
                 self.active_processes.append(p)
             else:
-                # Neither external tool is installed. Fall back to the
-                # built-in, dependency-free VRAM stress test (ctypes +
-                # libcuda.so.1 -- no toolkit, no compiler, fully offline).
-                print(f"[SYSTEM] gpu_burn/glmark2 not found -- using the built-in "
-                      f"offline GPU VRAM test instead ({self._gpu_count} GPU(s) detected).", flush=True)
+                # No gpu_burn, and either glmark2 isn't installed or there's
+                # no display for it to run against (glmark2 needs X11/
+                # Wayland -- it can't run over a plain SSH session on a
+                # headless server, which is exactly the case this is for).
+                # Fall back to the built-in, dependency-free VRAM stress
+                # test (ctypes + libcuda.so.1 -- no toolkit, no compiler,
+                # fully offline, works with just a terminal).
+                if not has_display:
+                    print(f"[SYSTEM] No display detected (headless/server session) -- "
+                          f"glmark2 can't run here even if installed. Using the "
+                          f"built-in offline GPU VRAM test instead "
+                          f"({self._gpu_count} GPU(s) detected).", flush=True)
+                else:
+                    print(f"[SYSTEM] gpu_burn/glmark2 not found -- using the built-in "
+                          f"offline GPU VRAM test instead ({self._gpu_count} GPU(s) detected).", flush=True)
                 for gi in range(self._gpu_count):
                     p = multiprocessing.Process(
                         target=heavy_gpu_worker,
@@ -941,6 +953,41 @@ class DiagnosticLogger:
 # 7. STANDALONE MENU: CLEANUP & DOWNLOAD (GRANULAR / ITEM-BY-ITEM)
 # ==============================================================================
 
+def _check_dependency_status(pkg):
+    """
+    Returns (dpkg_installed, actually_available).
+
+    dpkg_installed reflects only whether apt's package database has `pkg`
+    registered -- that's what determines whether "Delete Dependency" (apt
+    remove) makes sense. actually_available reflects whether the tool is
+    genuinely usable right now, which is what the stress engine itself
+    checks before launching something. These can legitimately disagree:
+    a binary installed via snap/flatpak/source, or shipped under a
+    differently-named package (e.g. glmark2-wayland providing the same
+    `glmark2` executable), shows up to `which` but not to `dpkg -s`.
+    """
+    dpkg_installed = subprocess.run(["dpkg", "-s", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+    # Map apt package name -> the actual binary/module the stress engine
+    # looks for, since these don't always match the package name.
+    binary_for_pkg = {"glmark2": "glmark2", "lm-sensors": "sensors"}
+
+    if pkg == "python3-numpy":
+        try:
+            import numpy  # noqa: F401
+            module_found = True
+        except ImportError:
+            module_found = False
+        return dpkg_installed, dpkg_installed or module_found
+
+    binary = binary_for_pkg.get(pkg)
+    if binary:
+        which_found = subprocess.run(["which", binary], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        return dpkg_installed, dpkg_installed or which_found
+
+    return dpkg_installed, dpkg_installed
+
+
 class CleanupDownloadMenu:
     def __init__(self):
         self.cursor = 0
@@ -956,8 +1003,13 @@ class CleanupDownloadMenu:
         self.items = []
         
         for pkg, desc in self.deps:
-            installed = subprocess.run(["dpkg", "-s", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-            status = "INSTALLED" if installed else "MISSING"
+            dpkg_installed, available = _check_dependency_status(pkg)
+            if dpkg_installed:
+                status = "INSTALLED"
+            elif available:
+                status = "FOUND (not via apt)"
+            else:
+                status = "MISSING"
             self.items.append({
                 "id": f"INSTALL_{pkg}",
                 "label": f"Install Dependency: {pkg:<15} [{status}] - {desc}",
@@ -966,8 +1018,8 @@ class CleanupDownloadMenu:
             })
 
         for pkg, desc in self.deps:
-            installed = subprocess.run(["dpkg", "-s", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-            if installed:
+            dpkg_installed, _ = _check_dependency_status(pkg)
+            if dpkg_installed:
                 self.items.append({
                     "id": f"REMOVE_{pkg}",
                     "label": f"Delete Dependency:  {pkg:<15} - {desc}",
